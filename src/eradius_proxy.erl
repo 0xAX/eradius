@@ -210,15 +210,3 @@ strip(Username, prefix, true, Separator) ->
         [Username] -> Username;
         [_ | Tail] -> string:join(Tail, Separator)
     end.
-
-% @TODO have no need in it right nowm but maybe we will use it later
-%update_proxy_metric(DefaultRouter, IP, Port) ->
-%    case DefaultRouter of
-%	undefined ->
-%	    MetricName = eradius_metrics:get_metric_name(IP, Port, routes_not_resolved, proxy),
-%	    exometer:update_or_create(MetricName, 1, spiral, [{time_span, 1000}]);
-%	_ ->
-%	    MetricName = eradius_metrics:get_metric_name(IP, Port, routes_resolved, proxy),
-%	    exometer:update_or_create(MetricName, 1, spiral, [{time_span, 1000}])
-%    end.
-
