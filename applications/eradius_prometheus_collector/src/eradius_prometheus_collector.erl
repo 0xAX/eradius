@@ -280,7 +280,7 @@ get_labels_and_val(_, {#client_counter{} = Cnt, client}, {Name, Labels})
   when Name =:= client_accounting_requests_total; 
        Name =:= client_accounting_responses_total ->
     Type = proplists:get_value(acct_type, Labels),
-    {{ClientName, ClientIP, _ClientPort}, {_, ServerIP, ServerPort}} = Cnt#client_counter.key,
+    {{ClientName, ClientIP}, {_, ServerIP, ServerPort}} = Cnt#client_counter.key,
     case get_value(Name, Type, Cnt) of
         undefined ->
             lists:map(fun (AcctType) ->
@@ -292,7 +292,7 @@ get_labels_and_val(_, {#client_counter{} = Cnt, client}, {Name, Labels})
             {Value, [{acct_type, Type} | ResLabels]}
     end;
 get_labels_and_val(MetricIdx, {#client_counter{} = Cnt, client}, _) ->
-   {{ClientName, ClientIP, _ClientPort}, {_, ServerIP, ServerPort}} = Cnt#client_counter.key,
+   {{ClientName, ClientIP}, {_, ServerIP, ServerPort}} = Cnt#client_counter.key,
    {element(MetricIdx + 1, Cnt), get_labels(Cnt, ServerIP, ServerPort, ClientName, ClientIP)};
 get_labels_and_val(_, _, _) ->
     {[], []}.

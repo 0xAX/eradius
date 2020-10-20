@@ -29,8 +29,8 @@ init_counter(#nas_prop{server_ip = ServerIP, server_port = ServerPort, nas_ip = 
 init_counter({{ServerIP, ServerPort}, NasIP})
   when is_tuple(ServerIP), is_integer(ServerPort), is_tuple(NasIP) ->
     #nas_counter{key = {{ServerIP, ServerPort}, NasIP}};
-init_counter({{ClientName, ClientIP, ClientPort}, {ServerName, ServerIp, ServerPort}}) ->
-    #client_counter{key = {{ClientName, ClientIP, ClientPort}, {ServerName, ServerIp, ServerPort}}, server_name = ServerName}.
+init_counter({{ClientName, ClientIP}, {ServerName, ServerIp, ServerPort}}) ->
+    #client_counter{key = {{ClientName, ClientIP}, {ServerName, ServerIp, ServerPort}}, server_name = ServerName}.
 
 %% @doc reset counters
 reset_counter(#server_counter{startTime = Up}) -> #server_counter{startTime = Up, resetTime = eradius_lib:timestamp()};
@@ -152,7 +152,8 @@ handle_call(reset, _From, State) ->
     {reply, ok, State#state{reset = eradius_lib:timestamp()}}.
 
 %% @private
-handle_cast({inc_counter, Counter, Key = {{_ClientName, _ClientIP, _ClientPort}, {_ServerName, _ServerIp, _ServerPort}}}, State) ->
+handle_cast({inc_counter, Counter, {{ClientName, ClientIP, _ClientPort}, {ServerName, ServerIp, ServerPort}}}, State) ->
+    Key = {{ClientName, ClientIP}, {ServerName, ServerIp, ServerPort}},
     Cnt0 = case ets:lookup(?MODULE, Key) of
                [] -> init_counter(Key);
                [Cnt] -> Cnt
@@ -171,7 +172,8 @@ handle_cast({inc_counter, Counter, Nas = #nas_prop{server_ip = ServerIP, server_
     ets:insert(?MODULE, do_inc_counter(Counter, Cnt1)),
     {noreply, State};
 
-handle_cast({dec_counter, Counter, Key = {{_ClientName, _ClientIP, _ClientPort}, {_ServerName, _ServerIp, _ServerPort}}}, State) ->
+handle_cast({dec_counter, Counter, {{ClientName, ClientIP, _ClientPort}, {ServerName, ServerIp, ServerPort}}}, State) ->
+    Key = {{ClientName, ClientIP}, {ServerName, ServerIp, ServerPort}},
     Cnt0 = case ets:lookup(?MODULE, Key) of
                [] -> init_counter(Key);
                [Cnt] -> Cnt
