@@ -53,7 +53,7 @@
 -export_type([port_number/0, req_id/0]).
 
 %% internal
--export([do_radius/7, handle_request/3, handle_remote_request/5, stats/2]).
+-export([do_radius/8, handle_request/3, handle_remote_request/5, stats/2]).
 
 -import(eradius_lib, [printable_peer/2]).
 
@@ -81,7 +81,8 @@
     port = 0       :: port_number(),     % Port number we are listening on
     transacts      :: ets:tid(),         % ETS table containing current transactions
     counter        :: #server_counter{}, % statistics counter,
-    name           :: atom()             % server name
+    name           :: atom(),            % server name
+    enabled_metrics :: map()             % set of enabled metrics      
 }).
 
 -optional_callbacks([validate_arguments/1]).
@@ -109,8 +110,11 @@ init({ServerName, IP, Port}) ->
     RecBuf = application:get_env(eradius, recbuf, 8192),
     case gen_udp:open(Port, [{active, once}, {ip, IP}, binary, {recbuf, RecBuf}]) of
         {ok, Socket} ->
+            {ok, Metrics} = application:get_env(eradius, enabled_metrics),
+            EnabledMetrics = lists:map(fun (Metric) -> {Metric, true} end, Metrics),
             {ok, #state{socket = Socket,
                         ip = IP, port = Port, name = ServerName,
+                        enabled_metrics = maps:from_list(EnabledMetrics),
                         transacts = ets:new(transacts, []),
                         counter = eradius_counter:init_counter({IP, Port, ServerName})}};
         {error, Reason} ->
@@ -119,38 +123,38 @@ init({ServerName, IP, Port}) ->
 
 %% @private
 handle_info(ReqUDP = {udp, Socket, FromIP, FromPortNo, Packet},
-            State  = #state{name = ServerName, transacts = Transacts, ip = _IP, port = _Port}) ->
+            State  = #state{name = ServerName, transacts = Transacts, ip = _IP, port = _Port, enabled_metrics = EnabledMetrics}) ->
     TS1 = eradius_lib:timestamp(milli_seconds),
     case lookup_nas(State, FromIP, Packet) of
         {ok, ReqID, Handler, NasProp} ->
             #nas_prop{server_ip = ServerIP, server_port = Port} = NasProp,
             ReqKey = {FromIP, FromPortNo, ReqID},
             NNasProp = NasProp#nas_prop{nas_port = FromPortNo},
-            eradius_counter:inc_counter(requests, NasProp),
+            inc_counter(requests, NasProp, EnabledMetrics),
             case ets:lookup(Transacts, ReqKey) of
                 [] ->
-                    HandlerPid = proc_lib:spawn_link(?MODULE, do_radius, [self(), ServerName, ReqKey, Handler, NNasProp, ReqUDP, TS1]),
+                    HandlerPid = proc_lib:spawn_link(?MODULE, do_radius, [self(), ServerName, ReqKey, Handler, NNasProp, ReqUDP, TS1, EnabledMetrics]),
                     ets:insert(Transacts, {ReqKey, {handling, HandlerPid}}),
                     ets:insert(Transacts, {HandlerPid, ReqKey}),
-                    eradius_counter:inc_counter(pending, NasProp);
+                    inc_counter(pending, NasProp, EnabledMetrics);
                 [{_ReqKey, {handling, HandlerPid}}] ->
                     %% handler process is still working on the request
                     ?LOG(debug, "~s From: ~s INF: Handler process ~p is still working on the request. duplicate request (being handled) ~p",
                         [printable_peer(ServerIP, Port), printable_peer(FromIP, FromPortNo), HandlerPid, ReqKey]),
-                    eradius_counter:inc_counter(dupRequests, NasProp);
+                         inc_counter(dupRequests, NasProp, EnabledMetrics);
                 [{_ReqKey, {replied, HandlerPid}}] ->
                     %% handler process waiting for resend message
                     HandlerPid ! {self(), resend, Socket},
                     ?LOG(debug, "~s From: ~s INF: Handler ~p waiting for resent message. duplicate request (resent) ~p",
                          [printable_peer(ServerIP, Port), printable_peer(FromIP, FromPortNo), HandlerPid, ReqKey]),
-                    eradius_counter:inc_counter(dupRequests, NasProp),
-                    eradius_counter:inc_counter(retransmissions, NasProp)
+                          inc_counter(dupRequests, NasProp, EnabledMetrics),
+                          inc_counter(retransmissions, NasProp, EnabledMetrics)
             end,
             NewState = State;
         {discard, Reason} when Reason == no_nodes_local, Reason == no_nodes ->
-            NewState = State#state{counter = eradius_counter:inc_counter(discardNoHandler, State#state.counter)};
+            NewState = State#state{counter = eradius_server:inc_counter(discardNoHandler, State#state.counter, EnabledMetrics)};
         {discard, _Reason} ->
-            NewState = State#state{counter = eradius_counter:inc_counter(invalidRequests, State#state.counter)}
+            NewState = State#state{counter = eradius_server:inc_counter(invalidRequests, State#state.counter, EnabledMetrics)}
     end,
     inet:setopts(Socket, [{active, once}]),
     {noreply, NewState};
@@ -196,8 +200,8 @@ lookup_nas(_State, _NasIP, _Packet) ->
 %% ------------------------------------------------------------------------------------------
 %% -- Request Handler
 %% @private
--spec do_radius(pid(), string(), term(), eradius_server_mon:handler(), #nas_prop{}, udp_packet(), integer()) -> any().
-do_radius(ServerPid, ServerName, ReqKey, Handler = {HandlerMod, _}, NasProp, {udp, Socket, FromIP, FromPort, EncRequest}, TS1) ->
+-spec do_radius(pid(), string(), term(), eradius_server_mon:handler(), #nas_prop{}, udp_packet(), integer(), map()) -> any().
+do_radius(ServerPid, ServerName, ReqKey, Handler = {HandlerMod, _}, NasProp, {udp, Socket, FromIP, FromPort, EncRequest}, TS1, EnabledMetrics) ->
     #nas_prop{server_ip = ServerIP, server_port = Port} = NasProp,
     Nodes = eradius_node_mon:get_module_nodes(HandlerMod),
     case run_handler(Nodes, NasProp, Handler, EncRequest) of
@@ -205,7 +209,7 @@ do_radius(ServerPid, ServerName, ReqKey, Handler = {HandlerMod, _}, NasProp, {ud
             ?LOG(debug, "~s From: ~s INF: Sending response for request ~p",
                         [printable_peer(ServerIP, Port), printable_peer(FromIP, FromPort), ReqKey]),
             TS2 = eradius_lib:timestamp(milli_seconds),
-            inc_counter({ReqCmd, RespCmd}, ServerName, NasProp, TS2 - TS1, Request),
+            inc_counter({ReqCmd, RespCmd}, ServerName, NasProp, TS2 - TS1, Request, EnabledMetrics),
             gen_udp:send(Socket, FromIP, FromPort, EncReply),
             case application:get_env(eradius, resend_timeout, 2000) of
                 ResendTimeout when ResendTimeout > 0, is_integer(ResendTimeout) ->
@@ -216,13 +220,13 @@ do_radius(ServerPid, ServerName, ReqKey, Handler = {HandlerMod, _}, NasProp, {ud
         {discard, Reason} ->
             ?LOG(debug, "~s From: ~s INF: Handler discarded the request ~p for reason ~1000.p",
                         [printable_peer(ServerIP, Port), printable_peer(FromIP, FromPort), Reason, ReqKey]),
-            inc_discard_counter(Reason, NasProp);
+            inc_discard_counter(Reason, NasProp, EnabledMetrics);
         {exit, Reason} ->
             ?LOG(debug, "~s From: ~s INF: Handler exited for reason ~p, discarding request ~p",
                         [printable_peer(ServerIP, Port), printable_peer(FromIP, FromPort), Reason, ReqKey]),
-            inc_discard_counter(packetsDropped, NasProp)
+            inc_discard_counter(packetsDropped, NasProp, EnabledMetrics)
     end,
-    eradius_counter:dec_counter(pending, NasProp).
+    dec_counter(pending, NasProp, EnabledMetrics).
 
 wait_resend_init(ServerPid, ReqKey, FromIP, FromPort, EncReply, ResendTimeout, Retries) ->
     erlang:send_after(ResendTimeout, self(), timeout),
@@ -347,62 +351,77 @@ apply_handler_mod(HandlerMod, HandlerArg, Request, NasProp) ->
             {exit, {Class, Reason}}
     end.
 
-inc_counter({ReqCmd, RespCmd}, ServerName, NasProp, Ms, Request) ->
-    inc_request_counter(ReqCmd, ServerName, NasProp, Ms, Request),
-    inc_reply_counter(RespCmd, NasProp, Request).
+dec_counter(pending, NasProp, #{pending_requests_total := true}) ->
+    eradius_counter:dec_counter(pending, NasProp);
+dec_counter(_, _, _) -> ok.
 
-inc_request_counter(request, ServerName, NasProp, Ms, _) ->
-    eradius_counter:observe(eradius_request_duration_milliseconds,
-                            NasProp, Ms, ServerName, "RADIUS request exeuction time"),
-    eradius_counter:observe(eradius_access_request_duration_milliseconds,
-                            NasProp, Ms, ServerName, "Access-Request execution time"),
-    eradius_counter:inc_request_counter(accessRequests, NasProp);
-inc_request_counter(accreq, ServerName, NasProp, Ms, Request) ->
-    eradius_counter:observe(eradius_request_duration_milliseconds,
-                            NasProp, Ms, ServerName, "RADIUS request exeuction time"),
-    eradius_counter:observe(eradius_accounting_request_duration_milliseconds,
-                            NasProp, Ms, ServerName, "Accounting-Request execution time"),
-    inc_request_counter_accounting(NasProp, Request);
-inc_request_counter(coareq, ServerName, NasProp, Ms, _) ->
-    eradius_counter:observe(eradius_request_duration_milliseconds,
-                            NasProp, Ms, ServerName, "RADIUS request exeuction time"),
-    eradius_counter:observe(eradius_coa_request_duration_milliseconds,
-                            NasProp, Ms, ServerName, "Coa-Request execution time"),
-    eradius_counter:inc_request_counter(coaRequests, NasProp);
-inc_request_counter(discreq, ServerName, NasProp, Ms, _) ->
-    eradius_counter:observe(eradius_request_duration_milliseconds,
-                            NasProp, Ms, ServerName, "RADIUS request exeuction time"),
-    eradius_counter:observe(eradius_disconnect_request_duration_milliseconds,
-                            NasProp, Ms, ServerName, "Disconnect-Request execution time"),
-    eradius_counter:inc_request_counter(discRequests, NasProp);
-inc_request_counter(_Cmd, _ServerName, _NasProp, _Ms, _Request) ->
+inc_counter(requests, NasProp, #{requests_total := true}) ->
+    eradius_counter:inc_counter(requests, NasProp);
+inc_counter(pending, NasProp, #{pending_requests_total := true}) ->
+    eradius_counter:inc_counter(pending, NasProp);
+inc_counter(dupRequests, NasProp, #{duplicated_requests_total := true}) ->
+    eradius_counter:inc_counter(dupRequests, NasProp);
+inc_counter(retransmissions, NasProp, #{retransmissions_total := true}) ->
+    eradius_counter:inc_counter(retransmissions, NasProp);
+inc_counter(discardNoHandler, Counter, _) ->
+    eradius_counter:inc_counter(discardNoHandler, Counter);
+inc_counter(invalidRequests, Counter, #{invalid_requests_total := true}) ->
+    eradius_counter:inc_counter(invalidRequests, Counter);
+inc_counter(_, _, _) ->
     ok.
 
-inc_reply_counter(accept, NasProp, _) ->
-    eradius_counter:inc_counter(replies, NasProp),
+inc_counter({ReqCmd, RespCmd}, ServerName, NasProp, Ms, Request, EnabledMetrics) ->
+    update_request_duration(NasProp, Ms, ServerName, EnabledMetrics),
+    update_request_counter_by_type(ReqCmd, ServerName, NasProp, Ms, Request, EnabledMetrics),
+    update_request_duration_by_type(ReqCmd, ServerName, NasProp, Ms, Request, EnabledMetrics),
+    inc_reply_counter_by_type(RespCmd, NasProp, Request, EnabledMetrics),
+    inc_replies(replies, NasProp, EnabledMetrics).
+
+update_request_counter_by_type(request, _ServerName, NasProp, _Ms, _, #{access_requests_total := true}) ->
+    eradius_counter:inc_request_counter(accessRequests, NasProp);
+update_request_counter_by_type(accreq, _ServerName, NasProp, _Ms, Request, #{accounting_requests_total := true}) ->
+    inc_request_counter_accounting(NasProp, Request);
+update_request_counter_by_type(coareq, _ServerName, NasProp, _Ms, _, #{coa_requests_total := true}) ->
+    eradius_counter:inc_request_counter(coaRequests, NasProp);
+update_request_counter_by_type(discreq, _ServerName, NasProp, _Ms, _, #{disconnect_requests := true}) ->
+    eradius_counter:inc_request_counter(discRequests, NasProp);
+update_request_counter_by_type(_Cmd, _ServerName, _NasProp, _Ms, _Request, _) -> ok.
+
+update_request_duration_by_type(request, ServerName, NasProp, Ms, _, #{access_request_duration_milliseconds := true}) ->
+    eradius_counter:observe(eradius_access_request_duration_milliseconds, NasProp, Ms, ServerName, "Access-Request execution time");
+update_request_duration_by_type(accreq, ServerName, NasProp, Ms, _, #{accounting_request_duration_milliseconds := true}) ->
+    eradius_counter:observe(eradius_accounting_request_duration_milliseconds, NasProp, Ms, ServerName, "Accounting-Request execution time");
+update_request_duration_by_type(coareq, ServerName, NasProp, Ms, _, #{coa_request_duration_milliseconds := true}) ->
+    eradius_counter:observe(eradius_coa_request_duration_milliseconds, NasProp, Ms, ServerName, "Coa-Request execution time");
+update_request_duration_by_type(discreq, ServerName, NasProp, Ms, _, #{disconnect_request_duration_milliseconds := true}) ->
+    eradius_counter:observe(eradius_disconnect_request_duration_milliseconds, NasProp, Ms, ServerName, "Disconnect-Request execution time");
+update_request_duration_by_type(_, _, _, _, _, _) -> ok.
+
+update_request_duration(NasProp, Ms, ServerName, #{request_duration_milliseconds := true}) ->
+    eradius_counter:observe(eradius_request_duration_milliseconds, NasProp, Ms, ServerName, "RADIUS request exeuction time");
+update_request_duration(_, _, _, _) -> ok.
+
+inc_replies(replies, NasProp, #{replies_total := true}) ->
+    eradius_counter:inc_counter(replies, NasProp);
+inc_replies(_, _, _) -> ok.
+
+inc_reply_counter_by_type(accept, NasProp, _, #{accept_responses_total := true}) ->
     eradius_counter:inc_reply_counter(accessAccepts, NasProp);
-inc_reply_counter(reject, NasProp, _) ->
-    eradius_counter:inc_counter(replies, NasProp),
+inc_reply_counter_by_type(reject, NasProp, _, #{reject_responses_total := true}) ->
     eradius_counter:inc_reply_counter(accessRejects, NasProp);
-inc_reply_counter(challenge, NasProp, _) ->
-    eradius_counter:inc_counter(replies, NasProp),
+inc_reply_counter_by_type(challenge, NasProp, _, #{access_challenge_responses_total := true}) ->
     eradius_counter:inc_reply_counter(accessChallenges, NasProp);
-inc_reply_counter(accresp, NasProp, Request) ->
-    eradius_counter:inc_counter(replies, NasProp),
+inc_reply_counter_by_type(accresp, NasProp, Request, #{accounting_responses_total := true}) ->
     inc_response_counter_accounting(NasProp, Request);
-inc_reply_counter(coaack, NasProp, _) ->
-    eradius_counter:inc_counter(replies, NasProp),
+inc_reply_counter_by_type(coaack, NasProp, _, #{coa_acks_total := true}) ->
     eradius_counter:inc_reply_counter(coaAcks, NasProp);
-inc_reply_counter(coanak, NasProp, _) ->
-    eradius_counter:inc_counter(replies, NasProp),
+inc_reply_counter_by_type(coanak, NasProp, _, #{coa_nacks_total := true}) ->
     eradius_counter:inc_reply_counter(coaNaks, NasProp);
-inc_reply_counter(discack, NasProp, _) ->
-    eradius_counter:inc_counter(replies, NasProp),
+inc_reply_counter_by_type(discack, NasProp, _, #{disconnect_acks_total := true}) ->
     eradius_counter:inc_reply_counter(discAcks, NasProp);
-inc_reply_counter(discnak, NasProp, _) ->
-    eradius_counter:inc_counter(replies, NasProp),
+inc_reply_counter_by_type(discnak, NasProp, _, #{disconnect_nacks_total := true}) ->
     eradius_counter:inc_reply_counter(discNaks, NasProp);
-inc_reply_counter(_Cmd, _NasProp, _Request) ->
+inc_reply_counter_by_type(_Cmd, _NasProp, _Request, _) ->
     ok.
 
 inc_request_counter_accounting(NasProp, #radius_request{attrs = Attrs}) ->
@@ -419,14 +438,15 @@ inc_response_counter_accounting(NasProp, #radius_request{attrs = Attrs}) ->
 inc_response_counter_accounting(_, _) ->
     ok.
 
-inc_discard_counter(bad_authenticator, NasProp) ->
+inc_discard_counter(bad_authenticator, NasProp, #{bad_authenticator_request_total := true}) ->
     eradius_counter:inc_counter(badAuthenticators, NasProp);
-inc_discard_counter(unknown_req_type, NasProp) ->
+inc_discard_counter(unknown_req_type, NasProp, #{unknown_type_request_total := true}) ->
     eradius_counter:inc_counter(unknownTypes, NasProp);
-inc_discard_counter(malformed, NasProp) ->
+inc_discard_counter(malformed, NasProp, #{malformed_requests_total := true}) ->
     eradius_counter:inc_counter(malformedRequests, NasProp);
-inc_discard_counter(_Reason, NasProp) ->
-    eradius_counter:inc_counter(packetsDropped, NasProp).
+inc_discard_counter(_Reason, NasProp, #{packets_dropped_total := true}) ->
+    eradius_counter:inc_counter(packetsDropped, NasProp);
+inc_discard_counter(_, _, _) -> ok.
 
 %% check if we can use persistent_term for config
 %% persistent term was added in OTP 21.2 but we can't

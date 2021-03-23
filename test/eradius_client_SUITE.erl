@@ -111,7 +111,8 @@ testSocket(Pid) ->
     idcounters = maps:new() :: map(),
     sockets = array:new() :: array:array(),
     sup :: pid(),
-    subscribed_clients = [] :: [{{integer(),integer(),integer(),integer()}, integer()}]
+    subscribed_clients = [] :: [{{integer(),integer(),integer(),integer()}, integer()}],
+    enabled_metrics :: map()
 }).
 
 split(N, List) -> split2(N, [], List).
@@ -151,8 +152,8 @@ test(false, Msg) ->
 
 check(OldState, NewState = #state{no_ports = P}, null, A) -> check(OldState, NewState, P, A);
 check(OldState, NewState = #state{socket_ip = A}, P, null) -> check(OldState, NewState, P, A);
-check(#state{sockets = OS, no_ports = _OP, idcounters = _OC, socket_ip = OA},
-        #state{sockets = NS, no_ports = NP, idcounters = NC, socket_ip = NA},
+check(#state{sockets = OS, no_ports = _OP, idcounters = _OC, socket_ip = OA, enabled_metrics = EM},
+        #state{sockets = NS, no_ports = NP, idcounters = NC, socket_ip = NA, enabled_metrics = EM},
         P, A) ->
     {ok, PA} = parse_ip(A),
     test(PA == NA, "Adress not configured") and
